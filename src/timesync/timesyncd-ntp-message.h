@@ -42,4 +42,8 @@ struct ntp_msg {
         struct ntp_ts origin_time;
         struct ntp_ts recv_time;
         struct ntp_ts trans_time;
+
+        uint8_t extensions[NTP_EXTENSION_MESSAGE_SIZE_MAX];
 } _packed_;
+
+#define NTP_HEADER_SIZE (size_t) offsetof(struct ntp_msg, extensions)

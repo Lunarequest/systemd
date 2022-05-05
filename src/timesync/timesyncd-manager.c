@@ -31,6 +31,12 @@
 #include "time-util.h"
 #include "timesyncd-conf.h"
 #include "timesyncd-manager.h"
+
+#if HAVE_OPENSSL
+#include "timesyncd-ntske-client.h"
+#include "timesyncd-nts-client.h"
+#endif
+
 #include "user-util.h"
 #include "util.h"
 
@@ -138,13 +144,32 @@ static int manager_send_request(Manager *m) {
 
         server_address_pretty(m->current_server_address, &pretty);
 
-        len = sendto(m->server_socket, &ntpmsg, sizeof(ntpmsg), MSG_DONTWAIT, &m->current_server_address->sockaddr.sa, m->current_server_address->socklen);
-        if (len == sizeof(ntpmsg)) {
-                m->pending = true;
-                log_debug("Sent NTP request to %s (%s).", strna(pretty), m->current_server_name->string);
+        if (m->ntske) {
+#if HAVE_OPENSSL
+                size_t packet_size;
+
+                r = ntp_extension_build_request_packet(m, &ntpmsg, &packet_size);
+                if (r < 0)
+                        return r;
+
+                len = sendto(m->server_socket, &ntpmsg, packet_size, MSG_DONTWAIT, &m->current_server_address->sockaddr.sa, m->current_server_address->socklen);
+                if (len == (int) packet_size) {
+                        m->pending = true;
+                        log_debug("Sent NTS request to %s (%s).", strna(pretty), m->current_server_name->string);
+                } else {
+                        log_debug_errno(errno, "Sending NTS request to %s (%s) failed: %m", strna(pretty), m->current_server_name->string);
+                        return manager_connect(m);
+                }
+#endif
         } else {
-                log_debug_errno(errno, "Sending NTP request to %s (%s) failed: %m", strna(pretty), m->current_server_name->string);
-                return manager_connect(m);
+                len = sendto(m->server_socket, &ntpmsg, sizeof(ntpmsg), MSG_DONTWAIT, &m->current_server_address->sockaddr.sa, m->current_server_address->socklen);
+                if (len == sizeof(ntpmsg)) {
+                        m->pending = true;
+                        log_debug("Sent NTP request to %s (%s).", strna(pretty), m->current_server_name->string);
+                } else {
+                        log_debug_errno(errno, "Sending NTP request to %s (%s) failed: %m", strna(pretty), m->current_server_name->string);
+                        return manager_connect(m);
+                }
         }
 
         /* re-arm timer with increasing timeout, in case the packets never arrive back */
@@ -436,11 +461,19 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 return manager_connect(m);
         }
 
-        /* Too short or too long packet? */
-        if (iov.iov_len < sizeof(struct ntp_msg) || (msghdr.msg_flags & MSG_TRUNC)) {
-                log_warning("Invalid response from server. Disconnecting.");
-                return manager_connect(m);
-        }
+        if (m->ntske) {
+               r = ntp_extension_parse_extention_field(m, &ntpmsg, len);
+               if (r < 0) {
+                       log_warning("NTS: Invalid response NTPSec server. Disconnecting.");
+                       return manager_connect(m);
+               }
+      } else {
+               /* Too short or too long packet? */
+               if (iov.iov_len < sizeof(struct ntp_msg) || (msghdr.msg_flags & MSG_TRUNC)) {
+                       log_warning("Invalid response from server. Disconnecting.");
+                       return manager_connect(m);
+               }
+         }
 
         if (!m->current_server_name ||
             !m->current_server_address ||
@@ -673,6 +706,78 @@ static void manager_listen_stop(Manager *m) {
         m->server_socket = safe_close(m->server_socket);
 }
 
+static int manager_ntske_listen_setup(Manager *m) {
+        _cleanup_free_ char *pretty = NULL;
+        union sockaddr_union addr = {};
+        int r;
+
+        assert(m);
+
+        if (m->ntske_server_socket > 0)
+                return 0;
+
+        assert(!m->ntske_event_receive);
+        assert(m->current_ntske_server_address);
+
+        addr.sa.sa_family = m->current_ntske_server_address->sockaddr.sa.sa_family;
+
+        m->ntske_server_socket = socket(addr.sa.sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (m->ntske_server_socket < 0)
+                return -errno;
+
+        r = bind(m->ntske_server_socket, &addr.sa, m->current_ntske_server_address->socklen);
+        if (r < 0)
+                return -errno;
+
+        r = setsockopt_int(m->ntske_server_socket, SOL_SOCKET, SO_TIMESTAMPNS, true);
+        if (r < 0)
+                return r;
+
+        if (addr.sa.sa_family == AF_INET)
+                (void) setsockopt_int(m->ntske_server_socket, IPPROTO_IP, IP_TOS, IPTOS_LOWDELAY);
+
+        m->current_ntske_server_address->sockaddr.in.sin_port = htobe16(4460);
+        r = connect(m->ntske_server_socket, &m->current_ntske_server_address->sockaddr.sa, m->current_ntske_server_address->socklen);
+        if (r < 0 && errno != EINPROGRESS)
+                return -errno;
+
+        r = ntske_tls_manager_init(m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to find set ntske tls manager: %m");
+
+        server_address_pretty(m->current_ntske_server_address, &pretty);
+
+        log_debug("Connecting to ntske server %s (%s).", strna(pretty), m->current_ntske_server_name->string);
+
+        r = ntske_openssl_connect(m);
+        if (r < 0)
+                log_error("Failed to connect to ntske server %s.", m->current_ntske_server_name->string);
+
+        log_debug("Sending request to to ntske server %s (%s).", strna(pretty), m->current_ntske_server_name->string);
+
+        r = ntske_tls_send_request(m);
+        if (r < 0)
+                log_error("Failed to send request to ntske server %s.", m->current_ntske_server_name->string);
+
+        r = sd_event_add_io(m->event, &m->ntske_event_receive, m->ntske_server_socket, EPOLLIN, ntske_tls_receive_response, m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add ntske server fd to event source: %m");
+
+
+       return 0;
+}
+
+static void manager_ntske_listen_stop(Manager *m) {
+        assert(m);
+
+        ntske_tls_manager_free(m);
+
+        m->ntske_event_receive = sd_event_source_unref(m->ntske_event_receive);
+        m->ntske_server_socket = safe_close(m->ntske_server_socket);
+        m->ntske_packet = ntske_packet_free(m->ntske_packet);
+}
+
+
 static int manager_begin(Manager *m) {
         _cleanup_free_ char *pretty = NULL;
         int r;
@@ -681,6 +786,7 @@ static int manager_begin(Manager *m) {
         assert_return(m->current_server_name, -EHOSTUNREACH);
         assert_return(m->current_server_address, -EHOSTUNREACH);
 
+        m->ntske_done = false;
         m->talking = false;
         m->missed_replies = NTP_MAX_MISSED_REPLIES;
         if (m->poll_interval_usec == 0)
@@ -781,6 +887,92 @@ static int manager_resolve_handler(sd_resolve_query *q, int ret, const struct ad
         return manager_begin(m);
 }
 
+void manager_set_ntske_server_name(Manager *m, ServerName *n) {
+        assert(m);
+
+        if (m->current_ntske_server_name == n)
+                return;
+
+        m->current_ntske_server_name = n;
+        m->current_ntske_server_address = NULL;
+        m->ntske = true;
+
+        manager_disconnect(m);
+
+        if (n)
+                log_debug("Selected ntske server %s.", n->string);
+}
+
+void manager_set_ntske_server_address(Manager *m, ServerAddress *a) {
+        assert(m);
+
+        if (m->current_ntske_server_address == a)
+                return;
+
+        m->current_ntske_server_address = a;
+        if (a)
+                m->current_ntske_server_name = a->name;
+
+        manager_disconnect(m);
+
+        if (a) {
+                _cleanup_free_ char *pretty = NULL;
+                server_address_pretty(a, &pretty);
+                log_debug("Selected address %s of ntske server %s.", strna(pretty), a->name->string);
+        }
+}
+
+static int manager_ntske_resolve_handler(sd_resolve_query *q, int ret, const struct addrinfo *ai, Manager *m) {
+        int r;
+
+        assert(q);
+        assert(m);
+        assert(m->current_ntske_server_name);
+
+        m->resolve_query_ntske = sd_resolve_query_unref(m->resolve_query_ntske);
+
+        if (ret != 0) {
+                log_debug("Failed to resolve ntske server %s: %s", m->current_ntske_server_name->string, gai_strerror(ret));
+                return manager_connect(m);
+        }
+
+        for (; ai; ai = ai->ai_next) {
+                _cleanup_free_ char *pretty = NULL;
+                ServerAddress *a;
+
+                assert(ai->ai_addr);
+                assert(ai->ai_addrlen >= offsetof(struct sockaddr, sa_data));
+
+                if (!IN_SET(ai->ai_addr->sa_family, AF_INET, AF_INET6)) {
+                        log_warning("Unsuitable address protocol for %s", m->current_ntske_server_name->string);
+                        continue;
+                }
+
+                r = server_address_new(m->current_ntske_server_name, &a, (const union sockaddr_union*) ai->ai_addr, ai->ai_addrlen);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add ntske server address: %m");
+
+                server_address_pretty(a, &pretty);
+                log_debug("Resolved ntske address %s for %s.", pretty, m->current_ntske_server_name->string);
+        }
+
+        if (!m->current_ntske_server_name->addresses) {
+                log_error("Failed to find suitable ntske address for host %s.", m->current_ntske_server_name->string);
+
+                /* Try next host */
+                return manager_connect(m);
+        }
+
+        manager_set_ntske_server_address(m, m->current_ntske_server_name->addresses);
+
+        r = manager_ntske_listen_setup(m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add setup ntske client: %m");
+
+        return manager_connect(m);
+}
+
+
 static int manager_retry_connect(sd_event_source *source, usec_t usec, void *userdata) {
         Manager *m = userdata;
 
@@ -808,89 +1000,107 @@ int manager_connect(Manager *m) {
                 return 0;
         }
 
-        /* If we already are operating on some address, switch to the
-         * next one. */
-        if (m->current_server_address && m->current_server_address->addresses_next)
-                manager_set_server_address(m, m->current_server_address->addresses_next);
+#if !HAVE_OPENSSL
+        m->ntske = false;
+#endif
+        if (m->ntske && !m->current_ntske_server_name->addresses) {
+                 struct addrinfo hints = {
+                         .ai_flags = AI_NUMERICSERV|AI_ADDRCONFIG,
+                         .ai_socktype = SOCK_DGRAM,
+                 };
+
+                server_name_flush_addresses(m->current_ntske_server_name);
+                log_debug("Resolving %s...", m->current_ntske_server_name->string);
+
+                r = resolve_getaddrinfo(m->resolve, &m->resolve_query, m->current_ntske_server_name->string, "123", &hints, manager_ntske_resolve_handler, NULL, m);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to create ntske resolver: %m");
+
+                return 0;
+        } else if (m->ntske && !m->ntske_done)
+                return 0;
         else {
-                static const struct addrinfo hints = {
-                        .ai_flags = AI_NUMERICSERV|AI_ADDRCONFIG,
-                        .ai_socktype = SOCK_DGRAM,
-                };
+                /* If we already are operating on some address, switch to the
+                 * next one. */
+                if (m->current_server_address && m->current_server_address->addresses_next)
+                        manager_set_server_address(m, m->current_server_address->addresses_next);
+                 else {
+                        struct addrinfo hints = {
+                                .ai_flags = AI_NUMERICSERV|AI_ADDRCONFIG,
+                                .ai_socktype = SOCK_DGRAM,
+                        };
 
-                /* Hmm, we are through all addresses, let's look for the next host instead */
-                if (m->current_server_name && m->current_server_name->names_next)
-                        manager_set_server_name(m, m->current_server_name->names_next);
-                else {
-                        ServerName *f;
-                        bool restart = true;
+                        /* Hmm, we are through all addresses, let's look for the next host instead */
+                        if (m->current_server_name && m->current_server_name->names_next)
+                                manager_set_server_name(m, m->current_server_name->names_next);
+                        else {
+                                ServerName *f;
+                                bool restart = true;
 
-                        /* Our current server name list is exhausted,
-                         * let's find the next one to iterate. First we try the runtime list, then the system list,
-                         * then the link list. After having processed the link list we jump back to the system list
-                         * if no runtime server list.
-                         * However, if all lists are empty, we change to the fallback list. */
-                        if (!m->current_server_name || m->current_server_name->type == SERVER_LINK) {
-                                f = m->runtime_servers;
-                                if (!f)
-                                        f = m->system_servers;
-                                if (!f)
+                                /* Our current server name list is exhausted,
+                                 * let's find the next one to iterate. First
+                                 * we try the system list, then the link list.
+                                 * After having processed the link list we
+                                 * jump back to the system list. However, if
+                                 * both lists are empty, we change to the
+                                 * fallback list. */
+                                if (!m->current_server_name || m->current_server_name->type == SERVER_LINK) {
+                                         f = m->system_servers;
+                                        if (!f)
+                                                f = m->link_servers;
+                                } else {
                                         f = m->link_servers;
-                        } else {
-                                f = m->link_servers;
-                                if (f)
-                                        restart = false;
-                                else {
-                                        f = m->runtime_servers;
                                         if (!f)
                                                 f = m->system_servers;
+                                        else
+                                                restart = false;
                                 }
-                        }
 
-                        if (!f)
-                                f = m->fallback_servers;
+                                if (!f)
+                                        f = m->fallback_servers;
 
-                        if (!f) {
-                                manager_set_server_name(m, NULL);
-                                log_debug("No server found.");
-                                return 0;
-                        }
+                                if (!f) {
+                                        manager_set_server_name(m, NULL);
+                                        log_debug("No server found.");
+                                        return 0;
+                                }
 
-                        if (restart && !m->exhausted_servers && m->poll_interval_usec > 0) {
-                                log_debug("Waiting after exhausting servers.");
-                                r = sd_event_add_time_relative(m->event, &m->event_retry, CLOCK_BOOTTIME, m->poll_interval_usec, 0, manager_retry_connect, m);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to create retry timer: %m");
+                                if (restart && !m->exhausted_servers && m->poll_interval_usec) {
+                                        log_debug("Waiting after exhausting servers.");
+                                        r = sd_event_add_time_relative(m->event, &m->event_retry, clock_boottime_or_monotonic(), m->poll_interval_usec, 0, manager_retry_connect, m);
+                                        if (r < 0)
+                                                return log_error_errno(r, "Failed to create retry timer: %m");
 
-                                m->exhausted_servers = true;
+                                        m->exhausted_servers = true;
 
-                                /* Increase the polling interval */
-                                if (m->poll_interval_usec < m->poll_interval_max_usec)
-                                        m->poll_interval_usec *= 2;
+                                        /* Increase the polling interval */
+                                        if (m->poll_interval_usec < m->poll_interval_max_usec)
+                                                m->poll_interval_usec *= 2;
 
-                                return 0;
-                        }
+                                        return 0;
+                                }
 
-                        m->exhausted_servers = false;
+                                m->exhausted_servers = false;
 
-                        manager_set_server_name(m, f);
-                }
+                                manager_set_server_name(m, f);
+                         }
 
-                /* Tell the resolver to reread /etc/resolv.conf, in
-                 * case it changed. */
-                res_init();
+                        /* Tell the resolver to reread /etc/resolv.conf, in
+                         * case it changed. */
+                        res_init();
 
-                /* Flush out any previously resolved addresses */
-                server_name_flush_addresses(m->current_server_name);
+                        /* Flush out any previously resolved addresses */
+                        server_name_flush_addresses(m->current_server_name);
 
-                log_debug("Resolving %s...", m->current_server_name->string);
+                        log_debug("Resolving %s...", m->current_server_name->string);
 
-                r = resolve_getaddrinfo(m->resolve, &m->resolve_query, m->current_server_name->string, "123", &hints, manager_resolve_handler, NULL, m);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to create resolver: %m");
+                        r = resolve_getaddrinfo(m->resolve, &m->resolve_query, m->current_server_name->string, "123", &hints, manager_resolve_handler, NULL, m);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to create resolver: %m");
 
-                return 1;
-        }
+                        return 1;
+                 }
+         }
 
         r = manager_begin(m);
         if (r < 0)
@@ -903,10 +1113,14 @@ void manager_disconnect(Manager *m) {
         assert(m);
 
         m->resolve_query = sd_resolve_query_unref(m->resolve_query);
+        m->resolve_query_ntske = sd_resolve_query_unref(m->resolve_query_ntske);
 
         m->event_timer = sd_event_source_unref(m->event_timer);
 
         manager_listen_stop(m);
+
+        if (m->ntske_done)
+               manager_ntske_listen_stop(m);
 
         m->event_clock_watch = sd_event_source_disable_unref(m->event_clock_watch);
 
@@ -930,6 +1144,10 @@ void manager_flush_server_names(Manager  *m, ServerType t) {
                 while (m->fallback_servers)
                         server_name_free(m->fallback_servers);
 
+        if (t == SERVER_NTSKE)
+           while (m->ntske_servers)
+                   server_name_free(m->ntske_servers);
+
         if (t == SERVER_RUNTIME)
                 manager_flush_runtime_servers(m);
 }
@@ -950,6 +1168,7 @@ Manager* manager_free(Manager *m) {
         manager_flush_server_names(m, SERVER_LINK);
         manager_flush_server_names(m, SERVER_RUNTIME);
         manager_flush_server_names(m, SERVER_FALLBACK);
+        manager_flush_server_names(m, SERVER_NTSKE);
 
         sd_event_source_unref(m->event_retry);
 
@@ -960,6 +1179,12 @@ Manager* manager_free(Manager *m) {
 
         sd_resolve_unref(m->resolve);
         sd_event_unref(m->event);
+
+        sd_event_unref(m->ntske_event);
+
+#if HAVE_OPENSSL
+        ntske_tls_manager_free(m);
+#endif
 
         sd_bus_flush_close_unref(m->bus);
 
@@ -1035,7 +1260,7 @@ bool manager_is_connected(Manager *m) {
 
         /* Return true when the manager is sending a request, resolving a server name, or
          * in a poll interval. */
-        return m->server_socket >= 0 || m->resolve_query || m->event_timer;
+        return m->server_socket >= 0 || m->resolve_query || m->event_timer || m->ntske_server_socket >= 0;
 }
 
 static int manager_network_event_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {

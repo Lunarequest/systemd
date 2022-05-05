@@ -13,6 +13,14 @@ systemd_timesyncd_sources = files(
         'timesyncd.c',
         'timesyncd-bus.c',
         'timesyncd-bus.h')
+if conf.get('HAVE_OPENSSL') == 1
+        systemd_timesyncd_sources += files(['timesyncd-nts-client.c',
+                                            'timesyncd-nts-client.h',
+                                            'timesyncd-ntske-client.c',
+                                            'timesyncd-ntske-client.h',
+                                            'timesyncd-ntske-protocol.h',
+                                            'timesyncd-ntske-protocol.h'])
+endif
 
 sources += custom_target(
         'timesyncd-gperf.c',

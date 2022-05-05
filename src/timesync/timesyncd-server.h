@@ -10,7 +10,8 @@ typedef struct ServerName ServerName;
 typedef enum ServerType {
         SERVER_SYSTEM,
         SERVER_FALLBACK,
-        SERVER_LINK,
+        SERVER_LINK
+        SERVER_NTSKE,
         SERVER_RUNTIME,
         _SERVER_TYPE_MAX,
         _SERVER_TYPE_INVALID = -EINVAL,

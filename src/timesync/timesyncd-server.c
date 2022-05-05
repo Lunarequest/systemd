@@ -40,6 +40,9 @@ int server_address_new(
         LIST_FIND_TAIL(addresses, n->addresses, tail);
         LIST_INSERT_AFTER(addresses, n->addresses, tail, a);
 
+        LIST_FIND_TAIL(names, m->ntske_servers, tail);
+        LIST_INSERT_AFTER(names, m->ntske_servers, tail, n);
+
         if (ret)
                 *ret = a;
 
@@ -103,12 +106,17 @@ int server_name_new(
                 assert_not_reached();
         }
 
-        if (type != SERVER_FALLBACK &&
+        if (type != SERVER_FALLBACK && ype != SERVER_NTSKE &&
             m->current_server_name &&
             m->current_server_name->type == SERVER_FALLBACK)
                 manager_set_server_name(m, NULL);
 
-        log_debug("Added new %s server %s.", server_type_to_string(type), string);
+                log_debug("Added new %s server %s.", server_type_to_string(type), string);
+         else if (type == SERVER_NTSKE) {
+                manager_set_ntske_server_name(m, n);
+
+                log_debug("Added new ntske server %s.", string);
+        }
 
         if (ret)
                 *ret = n;
@@ -131,6 +139,8 @@ ServerName *server_name_free(ServerName *n) {
                         LIST_REMOVE(names, n->manager->fallback_servers, n);
                 else if (n->type == SERVER_RUNTIME)
                         LIST_REMOVE(names, n->manager->runtime_servers, n);
+                else if (n->type == SERVER_NTSKE)
+                        LIST_REMOVE(names, n->manager->ntske_servers, n);
                 else
                         assert_not_reached();
 
